@@ -1,0 +1,10 @@
+Pillow==9.5.0
+six==1.16.0
+tensorboard==2.10.0
+timm==0.9.12
+tokenizers==0.19.1
+torch==2.2.0
+torch_fidelity @ git+https://github.com/LTH14/torch-fidelity.git@5746b7685c505fe3cb8ef0895c93b0d5f21f8b7d
+torchvision==0.16.0
+tqdm==4.65.2
+transformers==4.44.2
