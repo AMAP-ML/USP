@@ -1,10 +1,12 @@
-model="DiT-XL/2-VAE-simple"
+mode="sde"
+model="SiT-XL/2-VAE-simple"
 ckpt="/PATH/TO/YOUR/FINETUNE_CHECKPOINT"
 sample_dir="./samples"
 cfg="1.0"
 
 torchrun --master_addr ${MASTER_ADDR} --master-port ${MASTER_PORT} \
     --nnodes ${WORLD_SIZE} --node_rank ${RANK} --nproc-per-node=${GPUS} sample_ddp.py \
+    ${mode} \
     --model ${model} \
     --num-fid-samples 50000 \
     --ckpt ${ckpt} \

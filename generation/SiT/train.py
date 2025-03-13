@@ -1,11 +1,8 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
 """
-A minimal training script for DiT using PyTorch DDP.
+A minimal training script for SiT using PyTorch DDP.
 """
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
@@ -27,19 +24,22 @@ import argparse
 import logging
 import os
 
-from models import DiT_models
-from diffusion import create_diffusion
+from models import SiT_models
+from download import find_model
+from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
+from train_utils import parse_transport_args, parse_ode_args, parse_sde_args
+import wandb_utils
 
-# for sample & eval
+from sample_ddp import create_npz_from_sample_folder
 import math
 from tqdm import tqdm
-# from guided_diffusion.evaluations.evaluator import *
-# import tensorflow.compat.v1 as tf
 
 import torch_fidelity
-from distributed import is_master, init_distributed_device, broadcast_object
 from datetime import timedelta
+
+
+
 
 
 #################################################################################
@@ -83,7 +83,7 @@ def create_logger(logging_dir):
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt", mode='a')]
+            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
         )
         logger = logging.getLogger(__name__)
     else:  # dummy logger (does nothing)
@@ -112,57 +112,84 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
-def create_npz_from_sample_folder(sample_dir, num=50_000):
-    """
-    Builds a single .npz file from a folder of .png samples.
-    """
-    samples = []
-    for i in tqdm(range(num), desc="Building .npz file from samples"):
-        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
-        sample_np = np.asarray(sample_pil).astype(np.uint8)
-        samples.append(sample_np)
-    samples = np.stack(samples)
-    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
-    npz_path = f"{sample_dir}.npz"
-    np.savez(npz_path, arr_0=samples)
-    print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
-    return npz_path
 
 @torch.no_grad()
-def sample(model, vae, ckpt_path, latent_size, step, rank, args, device):
+def sample(model, vae, ckpt_path, latent_size, step, rank, args, device, mode='SDE'):
     import time
-    diffusion = create_diffusion(str(args.num_sampling_steps))
+
+    transport = create_transport(
+        args.path_type,
+        args.prediction,
+        args.loss_weight,
+        args.train_eps,
+        args.sample_eps
+    )
+
+    sampler = Sampler(transport)
     
+    if mode == "ODE":
+        if args.likelihood:
+            assert args.cfg_scale == 1, "Likelihood is incompatible with guidance"
+            sample_fn = sampler.sample_ode_likelihood(
+                sampling_method=args.sampling_method,
+                num_steps=args.num_sampling_steps,
+                atol=args.atol,
+                rtol=args.rtol,
+            )
+        else:
+            sample_fn = sampler.sample_ode(
+                sampling_method=args.sampling_method,
+                num_steps=args.num_sampling_steps,
+                atol=args.atol,
+                rtol=args.rtol,
+                reverse=args.reverse
+            )
+    elif mode == "SDE":
+        sample_fn = sampler.sample_sde(
+            sampling_method=args.sampling_method,
+            diffusion_form=args.diffusion_form,
+            diffusion_norm=args.diffusion_norm,
+            last_step=args.last_step,
+            last_step_size=args.last_step_size,
+            num_steps=args.num_sampling_steps,
+        )
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
 
-     # Create folder to save samples:
+    # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
+    # ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
     ckpt_string_name = os.path.basename(ckpt_path).replace(".pt", "")
-    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
-                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
-    # sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+
+    if mode == "ODE":
+        folder_name = f"{model_string_name}-{ckpt_string_name}-" \
+                  f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
+                  f"{mode}-{args.num_sampling_steps}-{args.sampling_method}"
+    elif mode == "SDE":
+        folder_name = f"{model_string_name}-{ckpt_string_name}-" \
+                    f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
+                    f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"\
+                    f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
     
+    # sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     exp_name = ckpt_path.split('/')[-3]
     sample_folder_dir = f"{args.sample_dir}/{exp_name}/{step}/{folder_name}"
     sample_root_path = os.path.dirname(sample_folder_dir)
-    result_save_path = os.path.join(sample_root_path, 'eval_result.txt')
+    result_save_path = os.path.join(sample_root_path, 'eval_result_torch.txt')
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
         print(f"Saving .png samples at {sample_folder_dir}")
-        
+
         os.chmod(sample_root_path, 0o777)
         print(f"Permissions for {sample_root_path} changed to 777.")
-        
     dist.barrier()
 
     if not len(os.listdir(sample_folder_dir)) >= 50000:
-        
-
         # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
         n = args.per_proc_batch_size
         global_batch_size = n * dist.get_world_size()
         # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
+        num_samples = len([name for name in os.listdir(sample_folder_dir) if (os.path.isfile(os.path.join(sample_folder_dir, name)) and ".png" in name)])
         total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
         if rank == 0:
             print(f"Total number of images that will be sampled: {total_samples}")
@@ -170,29 +197,28 @@ def sample(model, vae, ckpt_path, latent_size, step, rank, args, device):
         samples_needed_this_gpu = int(total_samples // dist.get_world_size())
         assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
         iterations = int(samples_needed_this_gpu // n)
+        done_iterations = int( int(num_samples // dist.get_world_size()) // n)
         pbar = range(iterations)
         pbar = tqdm(pbar) if rank == 0 else pbar
         total = 0
-        for _ in pbar:
+        
+        for i in pbar:
             # Sample inputs:
             z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
             y = torch.randint(0, args.num_classes, (n,), device=device)
-
+            
             # Setup classifier-free guidance:
             if using_cfg:
                 z = torch.cat([z, z], 0)
                 y_null = torch.tensor([1000] * n, device=device)
                 y = torch.cat([y, y_null], 0)
                 model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-                sample_fn = model.forward_with_cfg
+                model_fn = model.forward_with_cfg
             else:
                 model_kwargs = dict(y=y)
-                sample_fn = model.forward
+                model_fn = model.forward
 
-            # Sample images:
-            samples = diffusion.p_sample_loop(
-                sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
-            )
+            samples = sample_fn(z, model_fn, **model_kwargs)[-1]
             if using_cfg:
                 samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
@@ -204,6 +230,7 @@ def sample(model, vae, ckpt_path, latent_size, step, rank, args, device):
                 index = i * dist.get_world_size() + rank + total
                 Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
             total += global_batch_size
+            dist.barrier()
     else:
         print(f'Results exists! Save .NPZ now')
 
@@ -213,11 +240,12 @@ def sample(model, vae, ckpt_path, latent_size, step, rank, args, device):
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
     dist.barrier()
-    
+
+    # dist.barrier()
     # if rank == 0:
     #     if args.image_size == 256:
     #         input2 = None
-    #         fid_statistics_file = 'fid_stats/adm_in256_stats.npz'
+    #         fid_statistics_file = './fid_stats/adm_in256_stats.npz'
     #     else:
     #         raise NotImplementedError
     #     metrics_dict = torch_fidelity.calculate_metrics(
@@ -245,69 +273,20 @@ def sample(model, vae, ckpt_path, latent_size, step, rank, args, device):
     # dist.barrier()
     # time.sleep(10)
 
-
-def eval(sample_path, args):
-    config = tf.ConfigProto(
-        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
-    )
-    config.gpu_options.allow_growth = True
-    evaluator = Evaluator(tf.Session(config=config))
-
-    print("warming up TensorFlow...")
-    # This will cause TF to print a bunch of verbose stuff now rather
-    # than after the next print(), to help prevent confusion.
-    evaluator.warmup()
-
-    print("computing reference batch activations...")
-    ref_acts = evaluator.read_activations(args.ref_batch)
-    print("computing/reading reference batch statistics...")
-    ref_stats, ref_stats_spatial = evaluator.read_statistics(args.ref_batch, ref_acts)
-
-    print("computing sample batch activations...")
-    sample_acts = evaluator.read_activations(sample_path)
-    print("computing/reading sample batch statistics...")
-    sample_stats, sample_stats_spatial = evaluator.read_statistics(sample_path, sample_acts)
-
-    print("Computing evaluations...")
-    Inception_Score = evaluator.compute_inception_score(sample_acts[0])
-    print("Inception Score:", Inception_Score)
-
-    FID = sample_stats.frechet_distance(ref_stats)
-    print("FID:", FID)
-
-    sFID = sample_stats_spatial.frechet_distance(ref_stats_spatial)
-    print("sFID:", sFID)
-
-    # prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
-    # print("Precision:", prec)
-    # print("Recall:", recall)
-    # txt_path = f'{os.path.dirname(args.sample_batch)}/eval_results.txt'
-    # with open(txt_path, "w") as file:
-    #     file.write(f"Inception Score: {Inception_Score}\n")
-    #     file.write(f"FID: {FID}\n")
-    #     file.write(f"sFID: {sFID}\n")
-    #     file.write(f"Precision: {prec}\n")
-    #     file.write(f"Recall: {recall}\n")
-
-    txt_path = f'{os.path.dirname(sample_path)}/eval_results.txt'
-    with open(txt_path, "w") as file:
-        file.write(f"Inception Score: {Inception_Score}\n")
-        file.write(f"FID: {FID}\n")
-        file.write(f"sFID: {sFID}\n")
-
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new SiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
     # dist.init_process_group("nccl")
     dist.init_process_group("nccl", init_method="env://", timeout=timedelta(hours=1))
+
 
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
@@ -317,19 +296,20 @@ def main(args):
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    print(f"Local_batch_size= {local_batch_size}")
 
     # Setup an experiment folder:
     if rank == 0: 
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_index = len(glob(f"{args.results_dir}/*"))
     model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-    # import pdb; pdb.set_trace()
-    experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}" if not args.resume else os.path.dirname(args.resume).split('/checkpoints')[0]  # Create an experiment folder
+    experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{args.path_type}-{args.prediction}-{args.loss_weight}" if not args.ckpt else os.path.dirname(args.ckpt).split('/checkpoints')[0]  # Create an experiment folder
 
-    if args.exp_name and not args.resume:
+    if args.exp_name and not args.ckpt:
         experiment_dir = f"{experiment_dir}-{args.exp_name}"
 
-    checkpoint_dir = f"{experiment_dir}/checkpoints" if not args.resume else os.path.dirname(args.resume)  # Stores saved model checkpoints
+    checkpoint_dir = f"{experiment_dir}/checkpoints" if not args.ckpt else os.path.dirname(args.ckpt)  # Stores saved model checkpoints
     dist.barrier()
 
     if rank == 0:
@@ -338,17 +318,14 @@ def main(args):
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
         logger = create_logger(None)
-    
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
-    model = DiT_models[args.model](
+    model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
     )
-
-    assert not (args.finetune and args.resume)
 
     if args.finetune:
         checkpoint = torch.load(args.finetune, map_location='cpu')
@@ -392,54 +369,61 @@ def main(args):
             pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
             pos_tokens = torch.nn.functional.interpolate(
                 pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+                # pos_tokens, size=(new_size, new_size), mode='bilinear', align_corners=False)
 
             pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
             new_pos_embed = pos_tokens
             checkpoint_model[pos_embed_name] = new_pos_embed
         else:
             checkpoint_model[pos_embed_name] = pos_embed_checkpoint[:, num_extra_tokens:]
-        
-        if args.use_pretrain_layer >= 0: # < 0, unuse
-            keys_to_delete = []
-            for key in checkpoint_model.keys():
-                if key.startswith("blocks.") and int(key.split(".")[1]) >= args.use_pretrain_layer:
-                    keys_to_delete.append(key)
-
-            for key in keys_to_delete:
-                del checkpoint_model[key]
 
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
-    
+
+    # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        print("Load resume checkpoint from: %s" % args.resume)
+    if args.ckpt is not None:
+        # ckpt_path = args.ckpt
+        # state_dict = find_model(ckpt_path)
+        # model.load_state_dict(state_dict["model"])
+        # ema.load_state_dict(state_dict["ema"])
+        # opt.load_state_dict(state_dict["opt"])
+        # args = state_dict["args"]
+
+        checkpoint = torch.load(args.ckpt, map_location='cpu')
+        print("Load resume checkpoint from: %s" % args.ckpt)
         checkpoint_model = checkpoint['model']
         state_dict = model.state_dict()
         msg = model.load_state_dict(checkpoint_model, strict=True)
         print(msg)
 
         ema.load_state_dict(checkpoint["ema"], strict=True)
-        print("Succesfully load EMA model from: %s" % args.resume)
-        # opt.load_state_dict(state_dict["opt"])
+        print("Succesfully load EMA model from: %s" % args.ckpt)
 
 
-    
-    # Note that parameter initialization is done within the DiT constructor
 
     requires_grad(ema, False)
+    
+    # model = DDP(model.to(device), device_ids=[rank])
     model = DDP(model.to(device), device_ids=[rank % torch.cuda.device_count()])
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"/mnt/workspace/common/models/sd-vae-ft-ema").to(device)
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    transport = create_transport(
+        args.path_type,
+        args.prediction,
+        args.loss_weight,
+        args.train_eps,
+        args.sample_eps
+    )  # default: velocity; 
+    transport_sampler = Sampler(transport)
+    vae = AutoencoderKL.from_pretrained(f"/mnt/workspace/common/models/sd-vae-ft-ema").to(device)
+    logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
-    if args.resume:
+    if args.ckpt:
         opt.load_state_dict(checkpoint["opt"])
-        print("Succesfully load opt from: %s" % args.resume)
+        print("Succesfully load opt from: %s" % args.ckpt)
 
     # Setup data:
     transform = transforms.Compose([
@@ -459,7 +443,7 @@ def main(args):
     )
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
+        batch_size=local_batch_size,
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -473,23 +457,34 @@ def main(args):
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
-    if args.evaluate:
-        torch.cuda.empty_cache()
-        train_steps = int(os.path.basename(args.resume).split('.')[0])
-        # evaluate(model_without_ddp, vae, ema, args, batch_size=args.eval_bsz, cfg=args.cfg, use_ema=True, device=device)
-        sample(ema, vae, args.resume, latent_size, train_steps, rank, args, device)
-        torch.cuda.empty_cache()
-        return
-
     # Variables for monitoring/logging purposes:
-    train_steps = 0 if not args.resume else int(args.resume.split('/')[-1].split('.')[0])
-    log_steps = 0 
+    train_steps = 0 if not args.ckpt else int(args.ckpt.split('/')[-1].split('.')[0]) # xxx/0300000.pt
+    log_steps = 0
     running_loss = 0
     start_time = time()
 
+    # Labels to condition the model with (feel free to change):
+    # ys = torch.randint(1000, size=(local_batch_size,), device=device)
+    ys = torch.randint(1000, size=(4,), device=device)
+
+    use_cfg = args.cfg_scale > 1.0
+    # Create sampling noise:
+    n = ys.size(0)
+    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
+
+    # Setup classifier-free guidance:
+    if use_cfg:
+        zs = torch.cat([zs, zs], 0)
+        y_null = torch.tensor([1000] * n, device=device)
+        ys = torch.cat([ys, y_null], 0)
+        sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
+        model_fn = ema.forward_with_cfg
+    else:
+        sample_model_kwargs = dict(y=ys)
+        model_fn = ema.forward
+
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
-
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
@@ -498,11 +493,9 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
-            print(loss)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -522,14 +515,19 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                if args.wandb:
+                    wandb_utils.log(
+                        { "train loss": avg_loss, "train steps/sec": steps_per_sec },
+                        step=train_steps
+                    )
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
+            # Save SiT checkpoint:
+            # if train_steps % args.ckpt_every == 0 and train_steps > 0:
             if (train_steps % args.ckpt_every == 0 or train_steps in [50000]) and train_steps > 0:
-            # if (train_steps % args.ckpt_every == 0 or train_steps in [50000]) and train_steps > 0:
                 checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                 if rank == 0:
                     checkpoint = {
@@ -540,11 +538,27 @@ def main(args):
                     }
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-
-                # sample & evaluationgit
+                
                 if (train_steps % args.eval_every == 0 or train_steps in [50000]) and train_steps > 0:
                     sample(ema, vae, checkpoint_path, latent_size, train_steps, rank, args, device)
+
                 dist.barrier()
+
+                
+            # if train_steps % args.sample_every == 0 and train_steps > 0:
+            #     logger.info("Generating EMA samples...")
+            #     sample_fn = transport_sampler.sample_ode() # default to ode sampling
+            #     samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
+            #     dist.barrier()
+
+            #     if use_cfg: #remove null samples
+            #         samples, _ = samples.chunk(2, dim=0)
+            #     samples = vae.decode(samples / 0.18215).sample
+            #     out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
+            #     dist.all_gather_into_tensor(out_samples, samples)
+            #     if args.wandb:
+            #         wandb_utils.log_image(out_samples, train_steps)
+            #     logging.info("Generating EMA samples done.")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -554,11 +568,11 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
+    # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="./results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
@@ -567,40 +581,37 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=50000)
+    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--sample-every", type=int, default=10_000)
+    # parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
+
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Optional path to a custom SiT checkpoint")
+    
+    # 
+    parser.add_argument("--exp-name", type=str, default='')
     parser.add_argument('--finetune', default='',
                         help='finetune from checkpoint')
-    parser.add_argument('--resume', default='',
-                        help='resume from checkpoint')
 
-    parser.add_argument("--exp-name", type=str, default='')
-    parser.add_argument("--use-pretrain-layer", type=int, default=-1)
-    parser.add_argument("--load-patch-conv-method", type=str, default='interpolate') # 'interpolate' or 'copy'
-    parser.add_argument("--horovod", default=False, action="store_true", help="Use horovod for distributed training.")
-    parser.add_argument("--dist-backend", default="nccl", type=str, help="distributed backend")
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument(
-        "--ddp-static-graph",
-        default=False,
-        action='store_true',
-        help="Enable static graph optimization for DDP in PyTorch >= 1.11.",
-    )
-    parser.add_argument(
-        "--no-set-device-rank",
-        default=False,
-        action="store_true",
-        help="Don't set device index from local rank (when CUDA_VISIBLE_DEVICES restricted to one per proc)."
-    )
-    
     # evaluation
     parser.add_argument("--per-proc-batch-size", type=int, default=128)
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--sample-dir", type=str, default="./samples")
-    parser.add_argument("--ref-batch", default="./pretrained_model/VIRTUAL_imagenet256_labeled.npz", help="path to reference batch npz file")
     parser.add_argument("--eval-every", type=int, default=100000)
+
+    parse_transport_args(parser)
+
+    mode = "SDE"
+    if mode == "ODE":
+        parse_ode_args(parser)
+        # Further processing for ODE
+    elif mode == "SDE":
+        parse_sde_args(parser)
+        # Further processing for SDE
 
     args = parser.parse_args()
     main(args)
