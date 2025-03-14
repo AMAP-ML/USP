@@ -25,6 +25,7 @@ sh eval_dit.sh
 ```
 **Note:**
 - Same as [DiT](https://github.com/facebookresearch/DiT), we use [ADM's TensorFlow evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations) to calculate FID, Inception Score and other metrics.
+- VIRTUAL_imagenet256_labeled.npz can be downloaded from [ADM's TensorFlow evaluation suite](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz)
 
 
 # For SiTs
