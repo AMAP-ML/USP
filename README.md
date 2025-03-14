@@ -42,6 +42,7 @@ Recent studies have highlighted the interplay between diffusion models and repre
 Please refer to  [PRETRAIN.md](./pretrain/PRETRAIN.md)
 ## Downstream Task
 ### Generation
+Please refer to  [GENERATION.md](./generation/GENERATION.md)
 
 [//]: # (### Image Generation Under the DiT Framework)
 
