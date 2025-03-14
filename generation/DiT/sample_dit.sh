@@ -1,3 +1,4 @@
+#!/bin/bash
 model="DiT-XL/2-VAE-simple"
 ckpt="/PATH/TO/YOUR/FINETUNE_CHECKPOINT"
 sample_dir="./samples"
